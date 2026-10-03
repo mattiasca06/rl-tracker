@@ -5,8 +5,21 @@ use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use rlstatsapi::{ClientOptions, RocketLeagueStatsClient, StatsEvent};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use tokio::sync::mpsc as tokio_mpsc;
+
+/// Debug mode. When false (the default) the app writes no debug/junk files
+/// next to the exe. Set to true to dump diagnostics like `xhr_urls.json`.
+const DEBUG: bool = false;
+
+/// Write a diagnostics file, but only when DEBUG is on.
+fn debug_write(name: &str, contents: &str) {
+    if DEBUG {
+        let _ = std::fs::write(name, contents);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,6 +45,15 @@ struct FetchReq {
     url: String,
 }
 
+/// UI -> worker.
+enum WorkerCmd {
+    Fetch(FetchReq),
+    /// The playlist on screen changed; fetch that one first.
+    SetPlaylist(u32),
+    /// Manual mode was toggled; just wake the worker so it re-checks the flag.
+    Wake,
+}
+
 enum WorkerMsg {
     Status(String),
     DisplayName(Key, String),
@@ -55,7 +77,9 @@ struct TrackerApp {
     full_scale: bool,
 
     entries: HashMap<Key, Entry>,
-    req_tx: tokio_mpsc::UnboundedSender<FetchReq>,
+    req_tx: tokio_mpsc::UnboundedSender<WorkerCmd>,
+    sent_playlist: u32,
+    manual_flag: Arc<AtomicBool>,
     res_rx: std_mpsc::Receiver<WorkerMsg>,
     icons: RankIcons,
     browser_status: String,
@@ -458,27 +482,6 @@ fn chrono_lite_parse(s: &str) -> Option<i64> {
     Some(days * 86_400)
 }
 
-fn recursive_search(value: &serde_json::Value, best: &mut Vec<MmrPoint>) {
-    if let Some(arr) = value.as_array() {
-        let mut collected = Vec::new();
-        for item in arr {
-            if let Some(p) = point_from_history(item) {
-                collected.push(p);
-            }
-        }
-        if collected.len() > best.len() {
-            *best = collected;
-        }
-        for item in arr {
-            recursive_search(item, best);
-        }
-    } else if let Some(obj) = value.as_object() {
-        for v in obj.values() {
-            recursive_search(v, best);
-        }
-    }
-}
-
 /// Make sure points run oldest -> newest.
 fn normalize(mut pts: Vec<MmrPoint>) -> Vec<MmrPoint> {
     if let (Some(f), Some(l)) = (pts.first(), pts.last()) {
@@ -489,11 +492,126 @@ fn normalize(mut pts: Vec<MmrPoint>) -> Vec<MmrPoint> {
     pts
 }
 
-fn extract_points(v: &serde_json::Value) -> Option<Vec<MmrPoint>> {
-    let mut best = Vec::new();
-    recursive_search(v, &mut best);
-    if best.len() >= 2 {
-        Some(normalize(best))
+/// Which ranked playlist does a key / name / value refer to?
+/// 10 = 1v1, 11 = 2v2, 12 = 3v3.
+fn playlist_from_text(s: &str) -> Option<u32> {
+    let t = s.trim().to_lowercase();
+    match t.as_str() {
+        "10" | "playlist10" | "playlist_10" => return Some(10),
+        "11" | "playlist11" | "playlist_11" => return Some(11),
+        "12" | "playlist12" | "playlist_12" => return Some(12),
+        _ => {}
+    }
+    if t.contains("1v1") || t.contains("duel") {
+        Some(10)
+    } else if t.contains("2v2") || t.contains("doubles") {
+        Some(11)
+    } else if t.contains("3v3") || t.contains("triples") || t.contains("ranked standard") {
+        Some(12)
+    } else {
+        None
+    }
+}
+
+/// Look at an object's own fields (and attributes/metadata one level down)
+/// for a playlist id or name.
+fn playlist_from_object(obj: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
+    for k in ["playlistId", "playlist_id", "playlist", "playlistName", "name"] {
+        if let Some(v) = obj.get(k) {
+            if let Some(n) = v.as_u64() {
+                if (10..=12).contains(&n) {
+                    return Some(n as u32);
+                }
+            } else if let Some(st) = v.as_str() {
+                if let Some(p) = playlist_from_text(st) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    for k in ["attributes", "metadata"] {
+        if let Some(sub) = obj.get(k).and_then(|v| v.as_object()) {
+            if let Some(p) = playlist_from_object(sub) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// One candidate MMR series found somewhere in the JSON.
+struct Series {
+    path: String,
+    /// Playlist this series belongs to, if the surrounding data says so.
+    hint: Option<u32>,
+    points: Vec<MmrPoint>,
+}
+
+fn collect_series(
+    v: &serde_json::Value,
+    hint: Option<u32>,
+    path: &str,
+    out: &mut Vec<Series>,
+) {
+    match v {
+        serde_json::Value::Array(arr) => {
+            let pts: Vec<MmrPoint> = arr.iter().filter_map(point_from_history).collect();
+            if pts.len() >= 2 {
+                out.push(Series {
+                    path: path.to_string(),
+                    hint,
+                    points: pts,
+                });
+            }
+            for (i, item) in arr.iter().enumerate() {
+                if item.is_array() || (item.is_object() && point_from_history(item).is_none()) {
+                    collect_series(item, hint, &format!("{path}[{i}]"), out);
+                }
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            let here = playlist_from_object(obj).or(hint);
+            for (k, child) in obj {
+                let child_hint = playlist_from_text(k).or(here);
+                collect_series(child, child_hint, &format!("{path}.{k}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Pick the series for the playlist that was asked for.
+///  1. a series the data itself labels with this playlist (longest wins)
+///  2. otherwise a series with no label at all (can't tell, so longest wins)
+///  3. otherwise None: everything found belongs to OTHER playlists
+fn choose_series(series: Vec<Series>, playlist: u32) -> Option<Vec<MmrPoint>> {
+    if DEBUG {
+        for s in &series {
+            eprintln!(
+                "[series] {} hint={:?} len={}",
+                s.path,
+                s.hint,
+                s.points.len()
+            );
+        }
+    }
+    let longest = |it: Vec<Series>| it.into_iter().max_by_key(|s| s.points.len());
+
+    let (mine, rest): (Vec<Series>, Vec<Series>) =
+        series.into_iter().partition(|s| s.hint == Some(playlist));
+    if let Some(best) = longest(mine) {
+        return Some(best.points);
+    }
+    let unlabeled: Vec<Series> = rest.into_iter().filter(|s| s.hint.is_none()).collect();
+    longest(unlabeled).map(|s| s.points)
+}
+
+fn extract_points(v: &serde_json::Value, playlist: u32) -> Option<Vec<MmrPoint>> {
+    let mut series = Vec::new();
+    collect_series(v, None, "$", &mut series);
+    let pts = choose_series(series, playlist)?;
+    if pts.len() >= 2 {
+        Some(normalize(pts))
     } else {
         None
     }
@@ -591,6 +709,19 @@ const BLOCK_HEAVY_RESOURCES: bool = true;
 
 /// Minimum pause between two player fetches (plus up to ~0.7s random jitter).
 const FETCH_GAP_MS: u64 = 2000;
+/// No background fetching: only the playlist on screen is ever fetched.
+/// Requests for other playlists just wait in the queue until you switch to them.
+fn is_allowed(current: u32, pl: u32) -> bool {
+    pl == current
+}
+
+fn has_work(pending: &[FetchReq], current: u32) -> bool {
+    pending.iter().any(|r| is_allowed(current, r.key.1))
+}
+
+/// Sentinel result: the fetch was stopped because Manual mode was switched on.
+const PAUSED_MSG: &str = "__paused__";
+
 /// Extra cool-down after a Cloudflare challenge was seen.
 const CHALLENGE_PENALTY_SECS: u64 = 20;
 
@@ -621,9 +752,27 @@ fn looks_like_mmr_api(url: &str) -> bool {
     is_api && keyword
 }
 
+/// `...playlist=11...` in an API url -> Some(11)
+fn url_playlist_hint(url: &str) -> Option<u32> {
+    let u = url.to_lowercase();
+    for key in ["playlistid=", "playlist_id=", "playlist="] {
+        if let Some(i) = u.find(key) {
+            let digits: String = u[i + key.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 async fn run_mmr_worker(
-    mut rx: tokio_mpsc::UnboundedReceiver<FetchReq>,
+    mut rx: tokio_mpsc::UnboundedReceiver<WorkerCmd>,
     tx: std_mpsc::Sender<WorkerMsg>,
+    manual: Arc<AtomicBool>,
 ) {
     use std::collections::HashSet;
     use std::time::Duration;
@@ -693,19 +842,24 @@ async fn run_mmr_worker(
 
     match session.as_mut() {
         Some((_pool, _handle, page)) => {
-            // Warm up: loads the site once so Cloudflare cookies are ready.
-            let _ = tx.send(WorkerMsg::Status("Browser: warming up...".into()));
-            if let Err(e) = page
-                .navigate(
-                    "https://rocketleague.tracker.network/",
-                    WaitUntil::Selector("body".to_string()),
-                    Duration::from_secs(30),
-                )
-                .await
-            {
-                eprintln!("[browser] warm-up navigation warning: {e}");
+            if manual.load(Ordering::Relaxed) {
+                // Manual mode: hands off. The user does the first search themselves.
+                let _ = tx.send(WorkerMsg::Status("Browser: ready (manual mode)".into()));
+            } else {
+                // Warm up: loads the site once so Cloudflare cookies are ready.
+                let _ = tx.send(WorkerMsg::Status("Browser: warming up...".into()));
+                if let Err(e) = page
+                    .navigate(
+                        "https://rocketleague.tracker.network/",
+                        WaitUntil::Selector("body".to_string()),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                {
+                    eprintln!("[browser] warm-up navigation warning: {e}");
+                }
+                let _ = tx.send(WorkerMsg::Status("Browser: ready".into()));
             }
-            let _ = tx.send(WorkerMsg::Status("Browser: ready".into()));
         }
         None => {
             let _ = tx.send(WorkerMsg::Status(
@@ -715,13 +869,49 @@ async fn run_mmr_worker(
     }
 
     let mut next_allowed = std::time::Instant::now();
+    let mut current_playlist: u32 = 11;
+    let mut pending: Vec<FetchReq> = Vec::new();
 
-    while let Some(req) = rx.recv().await {
-        // Throttle: stay "Queued" until we're allowed to hit the site again.
+    macro_rules! apply_cmd {
+        ($cmd:expr) => {
+            match $cmd {
+                WorkerCmd::Fetch(r) => pending.push(r),
+                WorkerCmd::SetPlaylist(p) => current_playlist = p,
+                WorkerCmd::Wake => {}
+            }
+        };
+    }
+
+    'outer: loop {
+        // Sleep until there is work AND we're allowed to touch the browser.
+        while !has_work(&pending, current_playlist) || manual.load(Ordering::Relaxed) {
+            match rx.recv().await {
+                Some(cmd) => apply_cmd!(cmd),
+                None => break 'outer,
+            }
+        }
+
+        // Throttle first, so anything that arrives meanwhile can still jump the queue.
         let now = std::time::Instant::now();
         if now < next_allowed {
             tokio::time::sleep(next_allowed - now).await;
         }
+        while let Ok(cmd) = rx.try_recv() {
+            apply_cmd!(cmd);
+        }
+        if !has_work(&pending, current_playlist) || manual.load(Ordering::Relaxed) {
+            continue;
+        }
+
+        // Only the playlist on screen is fetched; anything else waits.
+        let Some(idx) = pending
+            .iter()
+            .position(|r| is_allowed(current_playlist, r.key.1))
+        else {
+            continue;
+        };
+        let req = pending.remove(idx);
+        let playlist = req.key.1;
 
         let _ = tx.send(WorkerMsg::Started(req.key.clone()));
         eprintln!("[mmr] >>> {}", req.url);
@@ -746,6 +936,11 @@ async fn run_mmr_worker(
         // ---- fetch one player on the shared page -------------------------
         let result: Result<Vec<MmrPoint>, String> = async {
             let (_pool, _handle, page) = session.as_mut().expect("session exists");
+
+            // Manual mode switched on: don't touch the page at all.
+            if manual.load(Ordering::Relaxed) {
+                return Err(PAUSED_MSG.to_string());
+            }
 
             // Applied after the warm-up page, so the first Cloudflare check
             // loads exactly like a normal browser.
@@ -775,10 +970,21 @@ async fn run_mmr_worker(
             let mut last_urls = String::new();
             let mut challenged = false;
             let mut name_sent = false;
+            let mut any_eval_ok = false;
 
             for attempt in 0..30 {
+                // A normal page with no data (never played this playlist) shouldn't
+                // keep us here for a minute. Only a Cloudflare wait gets the long budget.
+                if manual.load(Ordering::Relaxed) {
+                    return Err(PAUSED_MSG.to_string());
+                }
+                if !challenged && attempt >= 10 {
+                    break;
+                }
+
                 // 0) Cloudflare interstitial? Wait it out instead of burning attempts.
                 if let Ok(t) = page.title().await {
+                    any_eval_ok = true;
                     if !name_sent {
                         if let Some(n) = name_from_title(&t) {
                             let _ = tx.send(WorkerMsg::DisplayName(req.key.clone(), n));
@@ -813,7 +1019,7 @@ async fn run_mmr_worker(
                 if let Ok(hist) = js!(page, HIST_SCRIPT) {
                     if hist != "null" {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&hist) {
-                            if let Some(p) = extract_points(&v) {
+                            if let Some(p) = extract_points(&v, playlist) {
                                 eprintln!("[mmr] {} pts via standardProfilesHistory", p.len());
                                 return Ok(p);
                             }
@@ -833,7 +1039,11 @@ async fn run_mmr_worker(
                 last_urls = urls_json.clone();
                 let urls: Vec<String> = serde_json::from_str(&urls_json).unwrap_or_default();
 
-                for api in urls.iter().filter(|u| looks_like_mmr_api(u)) {
+                // Skip calls that are explicitly for a different playlist.
+                for api in urls.iter().filter(|u| {
+                    looks_like_mmr_api(u)
+                        && url_playlist_hint(u).map_or(true, |h| h == playlist)
+                }) {
                     if !tried.insert(api.clone()) {
                         continue;
                     }
@@ -866,7 +1076,7 @@ async fn run_mmr_worker(
                         continue;
                     }
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(p) = extract_points(&v) {
+                        if let Some(p) = extract_points(&v, playlist) {
                             eprintln!("[mmr] {} pts via {api}", p.len());
                             return Ok(p);
                         }
@@ -876,21 +1086,31 @@ async fn run_mmr_worker(
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
 
-            let _ = std::fs::write("xhr_urls.json", &last_urls);
+            debug_write("xhr_urls.json", &last_urls);
             if challenged {
                 Err("Cloudflare challenge didn't clear (if the browser window shows a checkbox, click it, then Refetch)."
                     .to_string())
+            } else if !any_eval_ok {
+                Err("Browser not responding (was its window closed?)".to_string())
             } else {
-                Err("No MMR data found (private profile? no ranked games?). See xhr_urls.json"
+                Err("No MMR history for this playlist (no ranked games, or private profile)"
                     .to_string())
             }
         }
         .await;
 
         // If the browser keeps failing (window closed, crashed), start fresh.
+        // Stopped by Manual mode: put it back at the front and show it as queued.
+        if matches!(&result, Err(e) if e == PAUSED_MSG) {
+            let _ = tx.send(WorkerMsg::Finished(req.key.clone(), result));
+            pending.insert(0, req);
+            continue;
+        }
+
+        // Only count genuine browser faults. "No ranked games" is a normal answer.
         match &result {
-            Ok(_) => failures = 0,
-            Err(_) => failures += 1,
+            Err(e) if e.contains("Browser not responding") => failures += 1,
+            _ => failures = 0,
         }
         if failures >= 3 {
             if let Some((_pool, handle, _page)) = session.take() {
@@ -1003,12 +1223,13 @@ enum CardAction {
 fn draw_card(
     ui: &mut egui::Ui,
     idx: usize,
-    player: &PlayerInfo,
+    _player: &PlayerInfo,
     entry: Option<&Entry>,
     full_scale: bool,
     card_h: f32,
     icons: &mut RankIcons,
     display_name: &str,
+    paused: bool,
 ) -> Option<CardAction> {
     let mut action = None;
 
@@ -1044,10 +1265,14 @@ fn draw_card(
 
         match entry {
             None | Some(Entry::Queued) => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Queued...");
-                });
+                if paused {
+                    ui.label(egui::RichText::new("Waiting (manual mode is on)").weak());
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Queued...");
+                    });
+                }
             }
             Some(Entry::Loading) => {
                 ui.horizontal(|ui| {
@@ -1067,29 +1292,22 @@ fn draw_card(
                 let cur = rank_label(current);
                 let pk = rank_label(peak);
 
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Current").weak());
-                    ui.label(
-                        egui::RichText::new(&cur.text)
-                            .color(cur.color)
-                            .strong()
-                            .size(15.0),
-                    );
-                    ui.label(egui::RichText::new(format!("({current})")).weak());
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Peak").weak());
-                    if let Some(tex) = icons.texture_for(ui.ctx(), &pk.icon_key) {
-                        let size = fit_size(tex.size, egui::vec2(26.0, 22.0));
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id, size)));
-                    }
-                    ui.label(
-                        egui::RichText::new(&pk.text)
-                            .color(pk.color)
-                            .strong()
-                            .size(15.0),
-                    );
-                    ui.label(egui::RichText::new(format!("({peak})")).weak());
+                // Current on the left, peak on the right. Plain text, normal size.
+                ui.columns(2, |cols| {
+                    cols[0].horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Current").weak());
+                        ui.label(&cur.text);
+                        ui.label(egui::RichText::new(format!("({current})")).weak());
+                    });
+                    cols[1].horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Peak").weak());
+                        if let Some(tex) = icons.texture_for(ui.ctx(), &pk.icon_key) {
+                            let size = fit_size(tex.size, egui::vec2(26.0, 22.0));
+                            ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id, size)));
+                        }
+                        ui.label(&pk.text);
+                        ui.label(egui::RichText::new(format!("({peak})")).weak());
+                    });
                 });
 
                 let (lo, hi) = y_bounds(points, full_scale);
@@ -1130,8 +1348,9 @@ impl TrackerApp {
     fn new(
         _cc: &eframe::CreationContext<'_>,
         rx: std_mpsc::Receiver<Vec<PlayerInfo>>,
-        req_tx: tokio_mpsc::UnboundedSender<FetchReq>,
+        req_tx: tokio_mpsc::UnboundedSender<WorkerCmd>,
         res_rx: std_mpsc::Receiver<WorkerMsg>,
+        manual_flag: Arc<AtomicBool>,
     ) -> Self {
         Self {
             players: Vec::new(),
@@ -1141,6 +1360,8 @@ impl TrackerApp {
             full_scale: false,
             entries: HashMap::new(),
             req_tx,
+            sent_playlist: 11,
+            manual_flag,
             res_rx,
             icons: RankIcons::new(),
             browser_status: "Browser: starting...".to_string(),
@@ -1172,43 +1393,56 @@ impl TrackerApp {
                 WorkerMsg::Finished(key, Ok(points)) => {
                     self.entries.insert(key, Entry::Done(points));
                 }
+                WorkerMsg::Finished(key, Err(e)) if e == PAUSED_MSG => {
+                    self.entries.insert(key, Entry::Queued);
+                }
                 WorkerMsg::Finished(key, Err(e)) => {
                     self.entries.insert(key, Entry::Failed(e));
                 }
             }
         }
 
+        // Tell the worker which playlist is on screen so it can prioritise it.
+        if self.sent_playlist != self.playlist {
+            let _ = self.req_tx.send(WorkerCmd::SetPlaylist(self.playlist));
+            self.sent_playlist = self.playlist;
+        }
+
         self.enqueue_missing();
     }
 
-    /// Queue a fetch for every player in the lobby we don't have data for
-    /// (for the currently selected playlist).
+    /// Queue a fetch for every player in the lobby for the playlist on screen
+    /// (if we don't have it yet). Nothing is fetched in the background: switch
+    /// tabs and that tab gets fetched.
     fn enqueue_missing(&mut self) {
+        let pl = self.playlist;
         for i in 0..self.players.len() {
-            let key = (self.players[i].primary_id.clone(), self.playlist);
+            let key = (self.players[i].primary_id.clone(), pl);
             if self.entries.contains_key(&key) {
                 continue;
             }
-            self.queue_player(i, false);
+            self.queue_player(i, pl, false);
         }
     }
 
-    fn queue_player(&mut self, idx: usize, force: bool) {
+    fn queue_player(&mut self, idx: usize, playlist: u32, force: bool) {
         let Some(p) = self.players.get(idx) else {
             return;
         };
-        let key = (p.primary_id.clone(), self.playlist);
+        let key = (p.primary_id.clone(), playlist);
         if !force && self.entries.contains_key(&key) {
             return;
         }
-        match tracker_url(&p.name, &p.primary_id, self.playlist) {
+        match tracker_url(&p.name, &p.primary_id, playlist) {
             Some(url) => {
                 self.entries.insert(key.clone(), Entry::Queued);
-                let _ = self.req_tx.send(FetchReq { key, url });
+                let _ = self.req_tx.send(WorkerCmd::Fetch(FetchReq { key, url }));
             }
             None => {
-                self.entries
-                    .insert(key, Entry::Failed("No profile (bot or unknown platform)".into()));
+                self.entries.insert(
+                    key,
+                    Entry::Failed("No profile (bot or unknown platform)".into()),
+                );
             }
         }
     }
@@ -1222,6 +1456,20 @@ impl eframe::App for TrackerApp {
         let mut refetch_all = false;
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let mut manual = self.manual_flag.load(Ordering::Relaxed);
+                let label = if manual { "Manual mode: ON" } else { "Manual mode: OFF" };
+                if ui
+                    .toggle_value(&mut manual, label)
+                    .on_hover_text(
+                        "ON: the app never touches the browser. Do a search by hand \
+                         there, then turn this OFF to start fetching.",
+                    )
+                    .changed()
+                {
+                    self.manual_flag.store(manual, Ordering::Relaxed);
+                    let _ = self.req_tx.send(WorkerCmd::Wake);
+                }
+                ui.separator();
                 ui.label("Playlist:");
                 ui.selectable_value(&mut self.playlist, 10, "1v1");
                 ui.selectable_value(&mut self.playlist, 11, "2v2");
@@ -1245,14 +1493,26 @@ impl eframe::App for TrackerApp {
         });
 
         if refetch_all {
+            let pl = self.playlist;
             for i in 0..self.players.len() {
-                self.queue_player(i, true);
+                self.queue_player(i, pl, true);
             }
         }
 
         let mut pending: Option<(usize, CardAction)> = None;
 
+        let manual_now = self.manual_flag.load(Ordering::Relaxed);
+
         egui::CentralPanel::default().show(ctx, |ui| {
+            if manual_now {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 80),
+                    "Manual mode is ON: the app is not touching the browser. Do one search by \
+                     hand in the browser window to get past Cloudflare, then switch Manual mode OFF.",
+                );
+                ui.add_space(4.0);
+            }
+
             if self.players.is_empty() {
                 ui.heading("Rocket League Tracker");
                 ui.label("Waiting for a match...");
@@ -1300,7 +1560,7 @@ impl eframe::App for TrackerApp {
                             p.name.clone()
                         };
                         if let Some(a) =
-                            draw_card(&mut uis[c], idx, p, entry, full_scale, row_h, icons, &shown)
+                            draw_card(&mut uis[c], idx, p, entry, full_scale, row_h, icons, &shown, manual_now)
                         {
                             pending = Some((idx, a));
                         }
@@ -1315,7 +1575,10 @@ impl eframe::App for TrackerApp {
                     open_tracker(&p.name.clone(), &p.primary_id.clone(), self.playlist);
                 }
             }
-            Some((i, CardAction::Refetch)) => self.queue_player(i, true),
+            Some((i, CardAction::Refetch)) => {
+                let pl = self.playlist;
+                self.queue_player(i, pl, true);
+            }
             None => {}
         }
     }
@@ -1342,11 +1605,14 @@ fn main() -> eframe::Result<()> {
     });
 
     // UI -> MMR worker (requests) and worker -> UI (results)
-    let (req_tx, req_rx) = tokio_mpsc::unbounded_channel::<FetchReq>();
+    let (req_tx, req_rx) = tokio_mpsc::unbounded_channel::<WorkerCmd>();
     let (res_tx, res_rx) = std_mpsc::channel::<WorkerMsg>();
+    // Manual mode starts ON: the app won't touch the browser until you say so.
+    let manual = Arc::new(AtomicBool::new(true));
+    let manual_worker = manual.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        rt.block_on(run_mmr_worker(req_rx, res_tx));
+        rt.block_on(run_mmr_worker(req_rx, res_tx, manual_worker));
     });
 
     let native_options = eframe::NativeOptions {
@@ -1358,7 +1624,7 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
-            Ok(Box::new(TrackerApp::new(cc, rx, req_tx, res_rx)))
+            Ok(Box::new(TrackerApp::new(cc, rx, req_tx, res_rx, manual)))
         }),
     );
 
