@@ -1,0 +1,5 @@
+@"
+/target
+**/*.rs.bk
+Cargo.lock.orig
+"@ | Out-File -Encoding utf8 .gitignore
