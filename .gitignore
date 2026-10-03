@@ -2,4 +2,10 @@
 /target
 **/*.rs.bk
 Cargo.lock.orig
+
+# Debug dumps from MMR fetch development
+initial_state*.json
+standard_profiles_history.json
+xhr_*.json
+segment.json
 "@ | Out-File -Encoding utf8 .gitignore
