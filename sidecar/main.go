@@ -8,8 +8,8 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -23,12 +23,12 @@ import (
 )
 
 type server struct {
-	mu     sync.Mutex // serialises upstream requests and reconnects
-	egs    *rlapi.EGS
-	psynet *rlapi.PsyNet
-	eos    *rlapi.EOSTokenResponse
-	rpc    *rlapi.PsyNetRPC
-	tokenF string
+	mu            sync.Mutex // serialises upstream requests and reconnects
+	egs           *rlapi.EGS
+	psynet        *rlapi.PsyNet
+	eos           *rlapi.EOSTokenResponse
+	rpc           *rlapi.PsyNetRPC
+	tokenF        string
 	openLoginPage bool
 
 	stMu   sync.RWMutex
