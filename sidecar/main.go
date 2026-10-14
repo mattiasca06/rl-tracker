@@ -8,10 +8,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,6 +29,7 @@ type server struct {
 	eos    *rlapi.EOSTokenResponse
 	rpc    *rlapi.PsyNetRPC
 	tokenF string
+	openLoginPage bool
 
 	stMu   sync.RWMutex
 	state  string
@@ -89,6 +92,10 @@ func (s *server) login() error {
 		return err
 	}
 	s.setState("login", dev.VerificationURI, dev.UserCode, "")
+	if s.openLoginPage {
+		openBrowser(dev.VerificationURI + "?userCode=" + dev.UserCode)
+		fmt.Printf("Enter code %s if the page does not fill it in.\n", dev.UserCode)
+	}
 	log.Printf("login: open %s and enter %s", dev.VerificationURI, dev.UserCode)
 	tok, err := s.egs.WaitForDeviceAuthorization(dev)
 	if err != nil {
@@ -192,14 +199,23 @@ func (s *server) handleSkills(w http.ResponseWriter, r *http.Request) {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:49200", "listen address")
 	tokenFile := flag.String("token-file", "", "where to keep the Epic refresh token")
+	loginOnly := flag.Bool("login-only", false, "log in to Epic (opens the browser), save the token, then exit")
 	flag.Parse()
 	if *tokenFile == "" {
 		d, _ := os.UserConfigDir()
 		*tokenFile = filepath.Join(d, "RLTracker", "eos_refresh_token")
 	}
 
-	s := &server{egs: rlapi.NewEGS(), psynet: rlapi.NewPsyNet(), tokenF: *tokenFile}
+	s := &server{egs: rlapi.NewEGS(), psynet: rlapi.NewPsyNet(), tokenF: *tokenFile, openLoginPage: *loginOnly}
 	s.setState("starting", "", "", "")
+
+	if *loginOnly {
+		if err := s.login(); err != nil {
+			log.Fatal("login failed: ", err)
+		}
+		fmt.Println("Login saved. You can start the tracker now.")
+		return
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", s.handleStatus)
@@ -222,4 +238,8 @@ func main() {
 
 	log.Println("listening on", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+
+func openBrowser(url string) {
+	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 }
