@@ -98,7 +98,11 @@ struct TrackerApp {
     players: Vec<LobbyPlayer>,
     scores: Vec<(i64, i64)>,
     cur_guid: String,
-    recorded: HashSet<String>,
+    /// Games that ended normally (no more autosaves for them).
+    finished: HashSet<String>,
+    dirty: bool,
+    last_autosave: Instant,
+    lobby_started: i64,
 
     // Rank lookups, keyed by primary_id (one request returns every playlist)
     entries: HashMap<String, Entry>,
@@ -748,6 +752,7 @@ fn result_text(rec: &MatchRecord) -> egui::RichText {
     match rec.won() {
         Some(true) => egui::RichText::new("WIN").color(egui::Color32::from_rgb(90, 200, 120)).strong(),
         Some(false) => egui::RichText::new("LOSS").color(egui::Color32::from_rgb(235, 90, 90)).strong(),
+        None if !rec.ended => egui::RichText::new("LEFT").color(egui::Color32::from_rgb(240, 170, 60)).strong(),
         None => egui::RichText::new("?").weak(),
     }
 }
@@ -825,7 +830,10 @@ impl TrackerApp {
             players: Vec::new(),
             scores: Vec::new(),
             cur_guid: String::new(),
-            recorded: HashSet::new(),
+            finished: HashSet::new(),
+            dirty: false,
+            last_autosave: Instant::now(),
+            lobby_started: 0,
             entries: HashMap::new(),
             inflight: HashSet::new(),
             req_tx,
@@ -855,13 +863,24 @@ impl TrackerApp {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 StatsMsg::State { guid, players, scores } => {
+                    if self.players.is_empty() {
+                        self.lobby_started = now_ts();
+                    }
                     self.cur_guid = guid;
                     self.players = players;
                     self.scores = scores;
+                    self.dirty = true;
                     self.status = format!("Tracking {} players", self.players.len());
                 }
-                StatsMsg::Ended { guid, winner } => self.record_match(guid, winner),
+                StatsMsg::Ended { guid, winner } => {
+                    if !guid.is_empty() {
+                        self.cur_guid = guid;
+                    }
+                    self.save_current(Some(winner));
+                }
                 StatsMsg::NewMatch => {
+                    // Last chance to store the game we're leaving.
+                    self.save_current(None);
                     self.players.clear();
                     self.scores.clear();
                     self.cur_guid.clear();
@@ -901,16 +920,26 @@ impl TrackerApp {
         self.enqueue_missing();
     }
 
-    /// Store the finished game (once) with everyone's ranks as we knew them.
-    fn record_match(&mut self, guid: String, winner: i64) {
-        let guid = if !guid.is_empty() {
-            guid
-        } else if !self.cur_guid.is_empty() {
-            self.cur_guid.clone()
+    /// Key of the game in the lobby (the match guid, or a stand-in if the API sent none).
+    fn lobby_key(&self) -> String {
+        if self.cur_guid.is_empty() {
+            format!("t{}", self.lobby_started)
         } else {
-            format!("t{}", now_ts())
-        };
-        if self.players.len() < 2 || !self.recorded.insert(guid.clone()) {
+            self.cur_guid.clone()
+        }
+    }
+
+    /// Save the game in the lobby with everyone's ranks as we know them. Called about once a
+    /// second while a game is on (so leaving early still leaves a record) and when it ends.
+    /// `ended` = Some(winning team) once the game finished normally.
+    fn save_current(&mut self, ended: Option<i64>) {
+        self.dirty = false;
+        self.last_autosave = Instant::now();
+        if self.players.len() < 2 {
+            return;
+        }
+        let guid = self.lobby_key();
+        if self.finished.contains(&guid) {
             return;
         }
         let players = self
@@ -932,24 +961,30 @@ impl TrackerApp {
             })
             .collect();
         let rec = MatchRecord {
-            guid,
+            guid: guid.clone(),
             ts: now_ts(),
             playlist: playlist_for_size(self.players.len()),
             my_team: self.my_team(),
-            winner,
+            winner: ended.unwrap_or(-1),
+            ended: ended.is_some(),
             scores: self.scores.clone(),
             players,
         };
-        self.store.push(rec);
+        let is_new = self.store.upsert(rec);
+        if ended.is_some() {
+            self.finished.insert(guid);
+        }
 
-        // Work out who "you" are: whoever keeps turning up in every game (real players only).
-        let ids: Vec<String> = self
-            .players
-            .iter()
-            .filter(|p| is_lookupable(&p.primary_id))
-            .map(|p| p.primary_id.clone())
-            .collect();
-        self.store.narrow_candidates(&ids);
+        // Work out who "you" are, once per game: whoever keeps turning up in every game.
+        if is_new {
+            let ids: Vec<String> = self
+                .players
+                .iter()
+                .filter(|p| is_lookupable(&p.primary_id))
+                .map(|p| p.primary_id.clone())
+                .collect();
+            self.store.narrow_candidates(&ids);
+        }
     }
 
     /// One batched request for every lobby player that is new, stale, or failed a while ago.
@@ -1132,8 +1167,17 @@ impl TrackerApp {
 }
 
 impl eframe::App for TrackerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_current(None);
+        self.store.save_blocking();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
+        // Autosave the game in progress about once a second.
+        if self.dirty && self.last_autosave.elapsed() >= Duration::from_secs(1) {
+            self.save_current(None);
+        }
         ctx.request_repaint_after(Duration::from_millis(100));
 
         let mut refetch_all = false;

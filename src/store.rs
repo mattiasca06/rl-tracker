@@ -2,7 +2,10 @@
 
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 
 /// Most matches kept on disk (the history page shows the newest 20).
 const MAX_MATCHES: usize = 500;
@@ -42,7 +45,11 @@ pub struct MatchRecord {
     pub playlist: u32,
     /// Your team number, if we knew who you were.
     pub my_team: Option<i64>,
+    /// Winning team; only meaningful when `ended`.
     pub winner: i64,
+    /// false = autosaved while in progress; stays false if you left before the end.
+    #[serde(default = "default_true")]
+    pub ended: bool,
     /// (team_num, goals)
     pub scores: Vec<(i64, i64)>,
     pub players: Vec<RecPlayer>,
@@ -51,6 +58,9 @@ pub struct MatchRecord {
 impl MatchRecord {
     /// Some(true) = you won, Some(false) = you lost, None = unknown.
     pub fn won(&self) -> Option<bool> {
+        if !self.ended {
+            return None;
+        }
         self.my_team.map(|t| t == self.winner)
     }
 
@@ -87,6 +97,51 @@ fn path() -> Option<PathBuf> {
     Some(dirs::data_local_dir()?.join("RLTracker").join("history.json"))
 }
 
+static SEQ: AtomicU64 = AtomicU64::new(0);
+/// Sequence number of the newest snapshot on disk, so an old queued save can't overwrite a newer one.
+static WRITTEN: Mutex<u64> = Mutex::new(0);
+
+/// Atomic write: write a temp file, flush it to disk, then rename over the real file.
+/// A crash mid-write leaves the previous history.json intact.
+fn write_atomic(seq: u64, json: &str) {
+    let Some(p) = path() else { return };
+    let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seq < *written {
+        return;
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("json.tmp");
+    let ok = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &p)
+    })();
+    match ok {
+        Ok(()) => *written = seq,
+        Err(e) => eprintln!("[store] save failed: {e}"),
+    }
+}
+
+fn writer() -> &'static mpsc::Sender<(u64, String)> {
+    static W: OnceLock<mpsc::Sender<(u64, String)>> = OnceLock::new();
+    W.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<(u64, String)>();
+        std::thread::spawn(move || {
+            while let Ok(mut latest) = rx.recv() {
+                // Only the newest queued snapshot matters.
+                while let Ok(newer) = rx.try_recv() {
+                    latest = newer;
+                }
+                write_atomic(latest.0, &latest.1);
+            }
+        });
+        tx
+    })
+}
+
 impl Store {
     pub fn load() -> Self {
         path()
@@ -95,29 +150,42 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// Queue a save on the background writer thread (never blocks the UI).
     pub fn save(&self) {
-        let Some(p) = path() else { return };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let tmp = p.with_extension("json.tmp");
-        let Ok(json) = serde_json::to_string(self) else { return };
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &p);
-        }
-    }
-
-    /// Adds a finished match (ignored if that guid is already stored).
-    pub fn push(&mut self, rec: MatchRecord) {
-        if self.matches.iter().any(|m| m.guid == rec.guid) {
+        if path().is_none() {
             return;
         }
-        self.matches.push(rec);
+        let Ok(json) = serde_json::to_string(self) else { return };
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = writer().send((seq, json));
+    }
+
+    /// Write right now (used on exit so nothing is lost).
+    pub fn save_blocking(&self) {
+        let Ok(json) = serde_json::to_string(self) else { return };
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        write_atomic(seq, &json);
+    }
+
+    /// Adds a match, or replaces the stored copy of the same game (used for the
+    /// once-a-second autosave of the game in progress). Returns true if it was new.
+    pub fn upsert(&mut self, rec: MatchRecord) -> bool {
+        let is_new = match self.matches.iter_mut().find(|m| m.guid == rec.guid) {
+            Some(existing) => {
+                *existing = rec;
+                false
+            }
+            None => {
+                self.matches.push(rec);
+                true
+            }
+        };
         if self.matches.len() > MAX_MATCHES {
             let extra = self.matches.len() - MAX_MATCHES;
             self.matches.drain(..extra);
         }
         self.save();
+        is_new
     }
 
     pub fn is_me(&self, id: &str) -> bool {
@@ -274,4 +342,8 @@ mod tests {
         s.narrow_candidates(&ids(&["alt", "c", "d"]));
         assert_eq!(s.my_ids, ids(&["main", "alt"]));
     }
+}
+
+fn default_true() -> bool {
+    true
 }
