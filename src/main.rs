@@ -26,7 +26,6 @@ struct Skill {
     tier: u32,
     division: u32,
     matches: u32,
-    #[allow(dead_code)]
     placement_matches: u32,
 }
 
@@ -528,9 +527,14 @@ fn skill_line(ui: &mut egui::Ui, icons: &mut RankIcons, s: &Skill, big: bool) {
         ui.vertical(|ui| {
             let size = if big { 20.0 } else { 14.0 };
             ui.label(egui::RichText::new(&rank.text).color(rank.color).size(size).strong());
-            let mmr = format!("{} MMR", s.mmr.round() as i64);
+            let mmr = format!("{} MMR", (s.mmr * 20.0 + 100.0).round() as i64);
             if big {
-                ui.label(format!("{mmr}  -  {} games", s.matches));
+                let placing = if s.placement_matches < 10 && s.matches == s.placement_matches {
+                    format!("  -  placements {}/10", s.placement_matches)
+                } else {
+                    String::new()
+                };
+                ui.label(format!("{mmr}  -  {} games{placing}", s.matches));
             } else {
                 ui.label(egui::RichText::new(mmr).weak());
             }
@@ -542,7 +546,7 @@ fn playlist_name(p: u32) -> &'static str {
     match p {
         10 => "1v1",
         11 => "2v2",
-        12 => "3v3",
+        13 => "3v3",
         _ => "?",
     }
 }
@@ -602,7 +606,7 @@ fn draw_card(
                     }
                 }
                 ui.separator();
-                for pl in [10, 11, 12].into_iter().filter(|p| *p != playlist) {
+                for pl in [10, 11, 13].into_iter().filter(|p| *p != playlist) {
                     if let Some(s) = find(pl) {
                         ui.label(egui::RichText::new(playlist_name(pl)).weak());
                         skill_line(ui, icons, s, false);
@@ -713,7 +717,7 @@ impl eframe::App for TrackerApp {
                 ui.label("Playlist:");
                 ui.selectable_value(&mut self.playlist, 10, "1v1");
                 ui.selectable_value(&mut self.playlist, 11, "2v2");
-                ui.selectable_value(&mut self.playlist, 12, "3v3");
+                ui.selectable_value(&mut self.playlist, 13, "3v3");
                 ui.separator();
                 if ui.button("Refetch all").clicked() {
                     refetch_all = true;
@@ -783,7 +787,7 @@ impl eframe::App for TrackerApp {
             }
 
             // 1v1: 2 side by side. 2v2: 2x2. 3v3: 3x2.
-            let cols: usize = if self.playlist == 12 { 3 } else { 2 };
+            let cols: usize = if self.playlist == 13 { 3 } else { 2 };
             let shown = self.players.len().min(8);
             let rows = shown.div_ceil(cols).max(1);
 
