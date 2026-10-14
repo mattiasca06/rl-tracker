@@ -35,8 +35,6 @@ enum StatsMsg {
         players: Vec<LobbyPlayer>,
         /// (team_num, goals)
         scores: Vec<(i64, i64)>,
-        /// Name of the player the camera is on (that's you while playing).
-        target: Option<String>,
     },
     Ended {
         guid: String,
@@ -546,15 +544,10 @@ async fn run_stats_client(tx: std_mpsc::Sender<StatsMsg>) {
                         .iter()
                         .map(|t| (t.team_num.unwrap_or(0), t.score.unwrap_or(0)))
                         .collect();
-                    let target = match data.game.b_has_target {
-                        Some(true) => data.game.target.map(|t| t.name),
-                        _ => None,
-                    };
                     let _ = tx.send(StatsMsg::State {
                         guid: data.match_guid.unwrap_or_default(),
                         players,
                         scores,
-                        target,
                     });
                 }
                 StatsEvent::MatchEnded(d) => {
@@ -624,9 +617,8 @@ fn rank_block(ui: &mut egui::Ui, icons: &mut RankIcons, skill: Option<&Skill>, p
                 } else {
                     String::new()
                 };
-                ui.label(
-                    egui::RichText::new(format!("{mmr} MMR  -  {} games{extra}", s.matches)).weak(),
-                );
+                ui.label(egui::RichText::new(format!("{mmr} MMR{extra}")).weak());
+                ui.label(format!("{} games this season", s.matches));
             });
         });
     });
@@ -645,6 +637,7 @@ fn ranks_row(ui: &mut egui::Ui, icons: &mut RankIcons, skills: &[Skill], current
 enum CardAction {
     Refetch,
     ThatsMe,
+    NotMe,
 }
 
 struct CardCtx<'a> {
@@ -668,6 +661,9 @@ fn draw_card(ui: &mut egui::Ui, icons: &mut RankIcons, c: CardCtx) -> Option<Car
             ui.label(egui::RichText::new(&c.display_name).strong().size(17.0));
             if c.is_me {
                 ui.label(egui::RichText::new("(you)").weak());
+                if ui.small_button("Not me").clicked() {
+                    action = Some(CardAction::NotMe);
+                }
             } else if lookupable && ui.small_button("That's me").clicked() {
                 action = Some(CardAction::ThatsMe);
             }
@@ -846,26 +842,19 @@ impl TrackerApp {
         }
     }
 
+    /// Your account in the current lobby (you may have several accounts).
+    fn me_in_lobby(&self) -> Option<&LobbyPlayer> {
+        self.players.iter().find(|p| self.store.is_me(&p.primary_id))
+    }
+
     fn my_team(&self) -> Option<i64> {
-        let me = self.store.my_id.as_deref()?;
-        self.players.iter().find(|p| p.primary_id == me).map(|p| p.team)
+        self.me_in_lobby().map(|p| p.team)
     }
 
     fn poll_events(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                StatsMsg::State { guid, players, scores, target } => {
-                    // First run: the player the camera is on while you play is you.
-                    if self.store.my_id.is_none() {
-                        if let Some(t) = target {
-                            if let Some(p) = players
-                                .iter()
-                                .find(|p| p.name == t && is_lookupable(&p.primary_id))
-                            {
-                                self.store.set_me(&p.primary_id);
-                            }
-                        }
-                    }
+                StatsMsg::State { guid, players, scores } => {
                     self.cur_guid = guid;
                     self.players = players;
                     self.scores = scores;
@@ -952,6 +941,15 @@ impl TrackerApp {
             players,
         };
         self.store.push(rec);
+
+        // Work out who "you" are: whoever keeps turning up in every game (real players only).
+        let ids: Vec<String> = self
+            .players
+            .iter()
+            .filter(|p| is_lookupable(&p.primary_id))
+            .map(|p| p.primary_id.clone())
+            .collect();
+        self.store.narrow_candidates(&ids);
     }
 
     /// One batched request for every lobby player that is new, stale, or failed a while ago.
@@ -983,7 +981,11 @@ impl TrackerApp {
 
     /// My games per playlist this season, from my own lookup.
     fn season_games(&self) -> Option<Vec<(u32, u32)>> {
-        let me = self.store.my_id.as_deref()?;
+        // The account in this lobby, else the one you used last.
+        let me = self
+            .me_in_lobby()
+            .map(|p| p.primary_id.as_str())
+            .or_else(|| self.store.my_ids.last().map(|s| s.as_str()))?;
         match self.entries.get(me) {
             Some(Entry::Done(ps, _)) => Some(
                 RANKED
@@ -1023,7 +1025,6 @@ impl TrackerApp {
         ];
 
         let Self { players, entries, inflight, icons, store, cur_guid, .. } = self;
-        let my_id = store.my_id.clone();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.columns(2, |cols| {
@@ -1046,7 +1047,7 @@ impl TrackerApp {
                             display_name,
                             entry,
                             inflight: inflight.contains(&p.primary_id),
-                            is_me: my_id.as_deref() == Some(p.primary_id.as_str()),
+                            is_me: store.is_me(&p.primary_id),
                             current_pl,
                             seen: &seen,
                         };
@@ -1186,7 +1187,10 @@ impl eframe::App for TrackerApp {
                     }
                     None => {
                         ui.label(
-                            egui::RichText::new("(click \"That's me\" on your card)").weak(),
+                            egui::RichText::new(
+                                "(finding you... after a few games, or click \"That's me\" on your card)",
+                            )
+                            .weak(),
                         );
                     }
                 }
@@ -1245,7 +1249,8 @@ impl eframe::App for TrackerApp {
         for (id, a) in actions {
             match a {
                 CardAction::Refetch => self.send_fetch(vec![id]),
-                CardAction::ThatsMe => self.store.set_me(&id),
+                CardAction::ThatsMe => self.store.add_me(&id),
+                CardAction::NotMe => self.store.remove_me(&id),
             }
         }
 

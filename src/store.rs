@@ -69,14 +69,21 @@ pub struct Encounter {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Store {
-    /// Your own primary id ("Steam|765...|0"), set automatically or via "That's me".
+    /// Your own accounts (primary ids like "Steam|765...|0"): found by elimination or via "That's me".
     #[serde(default)]
-    pub my_id: Option<String>,
+    pub my_ids: Vec<String>,
+    /// Players present in every recent game while we still don't know who you are.
+    #[serde(default)]
+    pub candidates: Vec<String>,
     #[serde(default)]
     pub matches: Vec<MatchRecord>,
 }
 
 fn path() -> Option<PathBuf> {
+    // Never touch the real history from unit tests.
+    if cfg!(test) {
+        return None;
+    }
     Some(dirs::data_local_dir()?.join("RLTracker").join("history.json"))
 }
 
@@ -113,10 +120,54 @@ impl Store {
         self.save();
     }
 
-    pub fn set_me(&mut self, id: &str) {
-        if self.my_id.as_deref() != Some(id) {
-            self.my_id = Some(id.to_string());
+    pub fn is_me(&self, id: &str) -> bool {
+        self.my_ids.iter().any(|m| m == id)
+    }
+
+    /// Mark an account as yours (you can have several) and fix up old games.
+    pub fn add_me(&mut self, id: &str) {
+        if !self.is_me(id) {
+            self.my_ids.push(id.to_string());
+        }
+        self.candidates.clear();
+        self.backfill_teams();
+        self.save();
+    }
+
+    pub fn remove_me(&mut self, id: &str) {
+        self.my_ids.retain(|m| m != id);
+        self.save();
+    }
+
+    /// Elimination: after each finished game keep only the players who were in every game
+    /// since we last knew who you were. When one is left, that's you. If nobody is left
+    /// (you switched account), start over from this game.
+    pub fn narrow_candidates(&mut self, ids: &[String]) {
+        if ids.iter().any(|i| self.is_me(i)) {
+            // One of your known accounts is here, nothing to work out.
+            self.candidates.clear();
             self.save();
+            return;
+        }
+        let inter: Vec<String> = self.candidates.iter().filter(|c| ids.contains(c)).cloned().collect();
+        self.candidates = if self.candidates.is_empty() || inter.is_empty() {
+            ids.to_vec()
+        } else {
+            inter
+        };
+        if self.candidates.len() == 1 {
+            let me = self.candidates[0].clone();
+            self.add_me(&me);
+        } else {
+            self.save();
+        }
+    }
+
+    /// Games stored before we knew who you were get their team (and so a W/L) filled in.
+    fn backfill_teams(&mut self) {
+        let mine = self.my_ids.clone();
+        for m in self.matches.iter_mut().filter(|m| m.my_team.is_none()) {
+            m.my_team = m.players.iter().find(|p| mine.contains(&p.id)).map(|p| p.team);
         }
     }
 
@@ -187,5 +238,40 @@ pub fn playlist_for_size(players: usize) -> u32 {
         4 => 11,
         6 => 13,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // narrow_candidates saves to disk via add_me; tests only touch the in-memory state.
+    #[test]
+    fn finds_you_by_elimination() {
+        let mut s = Store::default();
+        s.narrow_candidates(&ids(&["me", "a", "b", "c"]));
+        assert!(s.my_ids.is_empty());
+        s.narrow_candidates(&ids(&["me", "a", "x", "y"]));
+        assert!(s.my_ids.is_empty());
+        s.narrow_candidates(&ids(&["me", "p", "q", "r"]));
+        assert_eq!(s.my_ids, ids(&["me"]));
+        assert!(s.candidates.is_empty());
+    }
+
+    #[test]
+    fn second_account_is_found_separately() {
+        let mut s = Store::default();
+        s.my_ids = ids(&["main"]);
+        // Known account present: nothing to work out.
+        s.narrow_candidates(&ids(&["main", "a"]));
+        assert!(s.candidates.is_empty());
+        // Alt account games: main absent, so elimination starts over and finds the alt.
+        s.narrow_candidates(&ids(&["alt", "a", "b"]));
+        s.narrow_candidates(&ids(&["alt", "c", "d"]));
+        assert_eq!(s.my_ids, ids(&["main", "alt"]));
     }
 }
