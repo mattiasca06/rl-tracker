@@ -721,11 +721,28 @@ fn draw_seen_before(ui: &mut egui::Ui, id: &str, seen: &[store::Encounter]) {
     }
     let with = seen.iter().filter(|e| e.teammate == Some(true)).count();
     let against = seen.iter().filter(|e| e.teammate == Some(false)).count();
-    let summary = format!(
-        "Played before: {}x  ({with} with you, {against} against)  -  last {}",
-        seen.len(),
-        fmt_ts(seen[0].ts)
-    );
+    // Your W-L in games with / against them (unfinished or unknown games aren't counted).
+    let wl = |teammate: bool| {
+        let games = seen.iter().filter(|e| e.teammate == Some(teammate));
+        let w = games.clone().filter(|e| e.won == Some(true)).count();
+        let l = games.filter(|e| e.won == Some(false)).count();
+        (w, l)
+    };
+    let (vs_w, vs_l) = wl(false);
+    let (with_w, with_l) = wl(true);
+    let mut parts = Vec::new();
+    if against > 0 {
+        parts.push(format!("vs them {vs_w}W-{vs_l}L"));
+    }
+    if with > 0 {
+        parts.push(format!("with them {with_w}W-{with_l}L"));
+    }
+    let detail = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", parts.join(", "))
+    };
+    let summary = format!("Played before: {}x{detail}  -  last {}", seen.len(), fmt_ts(seen[0].ts));
     egui::CollapsingHeader::new(egui::RichText::new(summary).color(egui::Color32::from_rgb(120, 200, 255)))
         .id_salt(id)
         .show(ui, |ui| {
