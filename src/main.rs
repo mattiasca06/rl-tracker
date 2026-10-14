@@ -1,32 +1,49 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod store;
+
 use eframe::egui;
 use rlstatsapi::{ClientOptions, RocketLeagueStatsClient, StatsEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc as std_mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use store::{fmt_ts, now_ts, playlist_for_size, MatchRecord, RecPlayer, Skill, Store};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-struct PlayerInfo {
+/// A player in the current lobby (from the Stats API).
+#[derive(Clone, Debug, Default)]
+struct LobbyPlayer {
     name: String,
     primary_id: String,
+    team: i64,
+    score: i64,
+    goals: i64,
+    assists: i64,
+    saves: i64,
+    shots: i64,
 }
 
-/// One playlist's skill, as returned by the rlsidecar (PsyNet) bridge.
-#[derive(Clone, Debug, serde::Deserialize)]
-struct Skill {
-    playlist: u32,
-    mmr: f64,
-    tier: u32,
-    division: u32,
-    matches: u32,
-    placement_matches: u32,
+/// Stats API -> UI.
+enum StatsMsg {
+    State {
+        guid: String,
+        players: Vec<LobbyPlayer>,
+        /// (team_num, goals)
+        scores: Vec<(i64, i64)>,
+        /// Name of the player the camera is on (that's you while playing).
+        target: Option<String>,
+    },
+    Ended {
+        guid: String,
+        winner: i64,
+    },
+    /// A new match is starting: forget the old lobby.
+    NewMatch,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -62,24 +79,42 @@ enum WorkerMsg {
 }
 
 enum Entry {
-    Loading,
-    Done(PlayerSkills),
-    Failed(String),
+    Done(PlayerSkills, Instant),
+    Failed(String, Instant),
+}
+
+/// Ranks older than this get re-fetched when the player shows up in a lobby.
+const STALE_AFTER: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Live,
+    History,
 }
 
 struct TrackerApp {
-    players: Vec<PlayerInfo>,
-    rx: std_mpsc::Receiver<Vec<PlayerInfo>>,
+    rx: std_mpsc::Receiver<StatsMsg>,
     status: String,
 
-    playlist: u32,
+    // Current lobby
+    players: Vec<LobbyPlayer>,
+    scores: Vec<(i64, i64)>,
+    cur_guid: String,
+    recorded: HashSet<String>,
 
-    /// Keyed by primary_id (one request returns every playlist).
+    // Rank lookups, keyed by primary_id (one request returns every playlist)
     entries: HashMap<String, Entry>,
+    inflight: HashSet<String>,
     req_tx: std_mpsc::Sender<WorkerCmd>,
     res_rx: std_mpsc::Receiver<WorkerMsg>,
-    icons: RankIcons,
     sidecar: SidecarStatus,
+
+    store: Store,
+    session_start: i64,
+    page: Page,
+    /// Past games open in their own window (by match guid).
+    open_matches: Vec<String>,
+    icons: RankIcons,
 }
 
 // ---------------------------------------------------------------------------
@@ -469,11 +504,12 @@ fn run_worker(rx: std_mpsc::Receiver<WorkerCmd>, tx: std_mpsc::Sender<WorkerMsg>
     }
 }
 
+
 // ---------------------------------------------------------------------------
 // Background stats client
 // ---------------------------------------------------------------------------
 
-async fn run_stats_client(tx: std_mpsc::Sender<Vec<PlayerInfo>>) {
+async fn run_stats_client(tx: std_mpsc::Sender<StatsMsg>) {
     let options = ClientOptions::default();
 
     let mut client = loop {
@@ -481,26 +517,57 @@ async fn run_stats_client(tx: std_mpsc::Sender<Vec<PlayerInfo>>) {
             Ok(c) => break c,
             Err(e) => {
                 eprintln!("Connection failed: {e}. Retrying in 3s...");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
     };
 
     loop {
         match client.next_event().await {
-            Ok(Some(event)) => {
-                if let StatsEvent::UpdateState(data) = event {
-                    let players: Vec<PlayerInfo> = data
+            Ok(Some(event)) => match event {
+                StatsEvent::UpdateState(data) => {
+                    let players = data
                         .players
                         .iter()
-                        .map(|p| PlayerInfo {
+                        .map(|p| LobbyPlayer {
                             name: p.name.clone().unwrap_or_else(|| "Unknown".into()),
                             primary_id: p.primary_id.clone().unwrap_or_default(),
+                            team: p.team_num.unwrap_or(0),
+                            score: p.score.unwrap_or(0),
+                            goals: p.goals.unwrap_or(0),
+                            assists: p.assists.unwrap_or(0),
+                            saves: p.saves.unwrap_or(0),
+                            shots: p.shots.unwrap_or(0),
                         })
                         .collect();
-                    let _ = tx.send(players);
+                    let scores = data
+                        .game
+                        .teams
+                        .iter()
+                        .map(|t| (t.team_num.unwrap_or(0), t.score.unwrap_or(0)))
+                        .collect();
+                    let target = match data.game.b_has_target {
+                        Some(true) => data.game.target.map(|t| t.name),
+                        _ => None,
+                    };
+                    let _ = tx.send(StatsMsg::State {
+                        guid: data.match_guid.unwrap_or_default(),
+                        players,
+                        scores,
+                        target,
+                    });
                 }
-            }
+                StatsEvent::MatchEnded(d) => {
+                    let _ = tx.send(StatsMsg::Ended {
+                        guid: d.match_guid.unwrap_or_default(),
+                        winner: d.winner_team_num,
+                    });
+                }
+                StatsEvent::MatchCreated(_) | StatsEvent::MatchInitialized(_) => {
+                    let _ = tx.send(StatsMsg::NewMatch);
+                }
+                _ => {}
+            },
             Ok(None) => break,
             Err(e) => {
                 eprintln!("Event error: {e}. Reconnecting...");
@@ -511,36 +578,10 @@ async fn run_stats_client(tx: std_mpsc::Sender<Vec<PlayerInfo>>) {
 }
 
 // ---------------------------------------------------------------------------
-// Player card
+// Widgets
 // ---------------------------------------------------------------------------
 
-fn skill_line(ui: &mut egui::Ui, icons: &mut RankIcons, s: &Skill, big: bool) {
-    let rank = rank_from_tier(s.tier, s.division);
-    ui.horizontal(|ui| {
-        if let Some(tex) = icons.texture_for(ui.ctx(), &rank.icon_key) {
-            let max = if big { egui::vec2(72.0, 64.0) } else { egui::vec2(28.0, 24.0) };
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                tex.id,
-                fit_size(tex.size, max),
-            )));
-        }
-        ui.vertical(|ui| {
-            let size = if big { 20.0 } else { 14.0 };
-            ui.label(egui::RichText::new(&rank.text).color(rank.color).size(size).strong());
-            let mmr = format!("{} MMR", (s.mmr * 20.0 + 100.0).round() as i64);
-            if big {
-                let placing = if s.placement_matches < 10 && s.matches == s.placement_matches {
-                    format!("  -  placements {}/10", s.placement_matches)
-                } else {
-                    String::new()
-                };
-                ui.label(format!("{mmr}  -  {} games{placing}", s.matches));
-            } else {
-                ui.label(egui::RichText::new(mmr).weak());
-            }
-        });
-    });
-}
+const RANKED: [u32; 3] = [10, 11, 13];
 
 fn playlist_name(p: u32) -> &'static str {
     match p {
@@ -551,32 +592,99 @@ fn playlist_name(p: u32) -> &'static str {
     }
 }
 
-/// Returns true if "Refetch" was clicked.
-fn draw_card(
-    ui: &mut egui::Ui,
-    entry: Option<&Entry>,
-    card_h: f32,
-    icons: &mut RankIcons,
-    display_name: &str,
-    playlist: u32,
-    lookupable: bool,
-) -> bool {
-    let mut refetch = false;
+/// One playlist: icon, rank, MMR and games played.
+fn rank_block(ui: &mut egui::Ui, icons: &mut RankIcons, skill: Option<&Skill>, pl: u32, highlight: bool) {
+    ui.vertical(|ui| {
+        let label = egui::RichText::new(playlist_name(pl)).strong();
+        ui.label(if highlight {
+            label.color(egui::Color32::from_rgb(255, 200, 80))
+        } else {
+            label.weak()
+        });
+
+        let Some(s) = skill.filter(|s| s.tier > 0 || s.matches > 0) else {
+            ui.label(egui::RichText::new("No games").weak());
+            return;
+        };
+        let rank = rank_from_tier(s.tier, s.division);
+        let placing = s.placement_matches < 10 && s.matches == s.placement_matches;
+
+        ui.horizontal(|ui| {
+            if let Some(tex) = icons.texture_for(ui.ctx(), &rank.icon_key) {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    tex.id,
+                    fit_size(tex.size, egui::vec2(44.0, 38.0)),
+                )));
+            }
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(&rank.text).color(rank.color).strong().size(15.0));
+                let mmr = (s.mmr * 20.0 + 100.0).round() as i64;
+                let extra = if placing {
+                    format!("  (placements {}/10)", s.placement_matches)
+                } else {
+                    String::new()
+                };
+                ui.label(
+                    egui::RichText::new(format!("{mmr} MMR  -  {} games{extra}", s.matches)).weak(),
+                );
+            });
+        });
+    });
+}
+
+fn ranks_row(ui: &mut egui::Ui, icons: &mut RankIcons, skills: &[Skill], current: u32) {
+    ui.columns(3, |cols| {
+        for (c, pl) in RANKED.iter().enumerate() {
+            let s = skills.iter().find(|s| s.playlist == *pl);
+            rank_block(&mut cols[c], icons, s, *pl, *pl == current);
+        }
+    });
+}
+
+#[derive(Clone, Copy)]
+enum CardAction {
+    Refetch,
+    ThatsMe,
+}
+
+struct CardCtx<'a> {
+    player: &'a LobbyPlayer,
+    display_name: String,
+    entry: Option<&'a Entry>,
+    inflight: bool,
+    is_me: bool,
+    current_pl: u32,
+    seen: &'a [store::Encounter],
+}
+
+fn draw_card(ui: &mut egui::Ui, icons: &mut RankIcons, c: CardCtx) -> Option<CardAction> {
+    let mut action = None;
+    let lookupable = is_lookupable(&c.player.primary_id);
 
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.set_min_height((card_h - 24.0).max(60.0));
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(display_name).strong().size(17.0));
-            let busy = matches!(entry, Some(Entry::Loading));
+            ui.label(egui::RichText::new(&c.display_name).strong().size(17.0));
+            if c.is_me {
+                ui.label(egui::RichText::new("(you)").weak());
+            } else if lookupable && ui.small_button("That's me").clicked() {
+                action = Some(CardAction::ThatsMe);
+            }
             if lookupable
                 && ui
-                    .add_enabled(!busy, egui::Button::new("Refetch").small())
+                    .add_enabled(!c.inflight, egui::Button::new("Refetch").small())
                     .clicked()
             {
-                refetch = true;
+                action = Some(CardAction::Refetch);
             }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} pts  {}G {}A {}S",
+                    c.player.score, c.player.goals, c.player.assists, c.player.saves
+                ))
+                .weak(),
+            );
         });
 
         if !lookupable {
@@ -584,39 +692,124 @@ fn draw_card(
             return;
         }
 
-        match entry {
-            None | Some(Entry::Loading) => {
+        match c.entry {
+            None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label("Fetching...");
                 });
             }
-            Some(Entry::Failed(e)) => {
+            Some(Entry::Failed(e, _)) => {
                 ui.colored_label(egui::Color32::LIGHT_RED, e);
             }
-            Some(Entry::Done(ps)) => {
-                let find = |pl: u32| ps.skills.iter().find(|s| s.playlist == pl);
-                match find(playlist) {
-                    Some(s) => {
-                        ui.label(egui::RichText::new(playlist_name(playlist)).weak());
-                        skill_line(ui, icons, s, true);
-                    }
-                    None => {
-                        ui.label(format!("No {} ranked data.", playlist_name(playlist)));
-                    }
-                }
-                ui.separator();
-                for pl in [10, 11, 13].into_iter().filter(|p| *p != playlist) {
-                    if let Some(s) = find(pl) {
-                        ui.label(egui::RichText::new(playlist_name(pl)).weak());
-                        skill_line(ui, icons, s, false);
-                    }
-                }
-            }
+            Some(Entry::Done(ps, _)) => ranks_row(ui, icons, &ps.skills, c.current_pl),
+        }
+
+        if !c.is_me {
+            draw_seen_before(ui, &c.player.primary_id, c.seen);
         }
     });
 
-    refetch
+    action
+}
+
+/// "Played before" summary + the last 10 dates.
+fn draw_seen_before(ui: &mut egui::Ui, id: &str, seen: &[store::Encounter]) {
+    if seen.is_empty() {
+        ui.label(egui::RichText::new("First time you've seen this player").weak());
+        return;
+    }
+    let with = seen.iter().filter(|e| e.teammate == Some(true)).count();
+    let against = seen.iter().filter(|e| e.teammate == Some(false)).count();
+    let summary = format!(
+        "Played before: {}x  ({with} with you, {against} against)  -  last {}",
+        seen.len(),
+        fmt_ts(seen[0].ts)
+    );
+    egui::CollapsingHeader::new(egui::RichText::new(summary).color(egui::Color32::from_rgb(120, 200, 255)))
+        .id_salt(id)
+        .show(ui, |ui| {
+            for e in seen.iter().take(10) {
+                let side = match e.teammate {
+                    Some(true) => "with you",
+                    Some(false) => "against you",
+                    None => "-",
+                };
+                let res = match e.won {
+                    Some(true) => "you won",
+                    Some(false) => "you lost",
+                    None => "",
+                };
+                ui.label(format!("{}   {side}   {res}", fmt_ts(e.ts)));
+            }
+            if seen.len() > 10 {
+                ui.label(egui::RichText::new(format!("...and {} older", seen.len() - 10)).weak());
+            }
+        });
+}
+
+fn result_text(rec: &MatchRecord) -> egui::RichText {
+    match rec.won() {
+        Some(true) => egui::RichText::new("WIN").color(egui::Color32::from_rgb(90, 200, 120)).strong(),
+        Some(false) => egui::RichText::new("LOSS").color(egui::Color32::from_rgb(235, 90, 90)).strong(),
+        None => egui::RichText::new("?").weak(),
+    }
+}
+
+/// "5 - 3" from your point of view (or blue - orange if we never knew your team).
+fn score_text(rec: &MatchRecord) -> String {
+    match rec.my_team {
+        Some(t) => {
+            let opp = rec.scores.iter().map(|(n, _)| *n).find(|n| *n != t).unwrap_or(1 - t);
+            format!("{} - {}", rec.score_of(t), rec.score_of(opp))
+        }
+        None => format!("{} - {}", rec.score_of(0), rec.score_of(1)),
+    }
+}
+
+/// Everything about one stored game (shown in its own window).
+fn draw_match_detail(ui: &mut egui::Ui, icons: &mut RankIcons, rec: &MatchRecord) {
+    ui.horizontal(|ui| {
+        ui.heading(format!("{}  -  {}", fmt_ts(rec.ts), playlist_name(rec.playlist)));
+        ui.label(result_text(rec).size(20.0));
+        ui.heading(score_text(rec));
+    });
+    ui.separator();
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        let mine = rec.my_team.unwrap_or(0);
+        for (title, team_pred) in [("Your team", true), ("Opponents", false)] {
+            let label = if rec.my_team.is_some() {
+                title.to_string()
+            } else if team_pred {
+                "Blue".to_string()
+            } else {
+                "Orange".to_string()
+            };
+            ui.label(egui::RichText::new(label).strong().size(16.0));
+            for p in rec.players.iter().filter(|p| (p.team == mine) == team_pred) {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&p.name).strong().size(16.0));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} pts  {}G {}A {}S  {} shots",
+                                p.score, p.goals, p.assists, p.saves, p.shots
+                            ))
+                            .weak(),
+                        );
+                    });
+                    if p.skills.is_empty() {
+                        ui.label(egui::RichText::new("No rank data was available").weak());
+                    } else {
+                        ranks_row(ui, icons, &p.skills, rec.playlist);
+                    }
+                });
+            }
+            ui.add_space(6.0);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -626,30 +819,66 @@ fn draw_card(
 impl TrackerApp {
     fn new(
         _cc: &eframe::CreationContext<'_>,
-        rx: std_mpsc::Receiver<Vec<PlayerInfo>>,
+        rx: std_mpsc::Receiver<StatsMsg>,
         req_tx: std_mpsc::Sender<WorkerCmd>,
         res_rx: std_mpsc::Receiver<WorkerMsg>,
     ) -> Self {
         Self {
-            players: Vec::new(),
             rx,
             status: "Waiting for Rocket League...".to_string(),
-            playlist: 11,
+            players: Vec::new(),
+            scores: Vec::new(),
+            cur_guid: String::new(),
+            recorded: HashSet::new(),
             entries: HashMap::new(),
+            inflight: HashSet::new(),
             req_tx,
             res_rx,
-            icons: RankIcons::new(),
             sidecar: SidecarStatus {
                 state: "starting".into(),
                 ..Default::default()
             },
+            store: Store::load(),
+            session_start: now_ts(),
+            page: Page::Live,
+            open_matches: Vec::new(),
+            icons: RankIcons::new(),
         }
     }
 
+    fn my_team(&self) -> Option<i64> {
+        let me = self.store.my_id.as_deref()?;
+        self.players.iter().find(|p| p.primary_id == me).map(|p| p.team)
+    }
+
     fn poll_events(&mut self) {
-        while let Ok(players) = self.rx.try_recv() {
-            self.players = players;
-            self.status = format!("Tracking {} players", self.players.len());
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                StatsMsg::State { guid, players, scores, target } => {
+                    // First run: the player the camera is on while you play is you.
+                    if self.store.my_id.is_none() {
+                        if let Some(t) = target {
+                            if let Some(p) = players
+                                .iter()
+                                .find(|p| p.name == t && is_lookupable(&p.primary_id))
+                            {
+                                self.store.set_me(&p.primary_id);
+                            }
+                        }
+                    }
+                    self.cur_guid = guid;
+                    self.players = players;
+                    self.scores = scores;
+                    self.status = format!("Tracking {} players", self.players.len());
+                }
+                StatsMsg::Ended { guid, winner } => self.record_match(guid, winner),
+                StatsMsg::NewMatch => {
+                    self.players.clear();
+                    self.scores.clear();
+                    self.cur_guid.clear();
+                    self.status = "Waiting for Rocket League...".to_string();
+                }
+            }
         }
 
         while let Ok(msg) = self.res_rx.try_recv() {
@@ -657,6 +886,7 @@ impl TrackerApp {
                 WorkerMsg::Status(st) => self.sidecar = st,
                 WorkerMsg::Result(ids, Ok(found)) => {
                     for id in ids {
+                        self.inflight.remove(&id);
                         // A player PsyNet returned nothing for just has no ranked data.
                         let ps = found
                             .iter()
@@ -667,12 +897,13 @@ impl TrackerApp {
                                 name: String::new(),
                                 skills: Vec::new(),
                             });
-                        self.entries.insert(id, Entry::Done(ps));
+                        self.entries.insert(id, Entry::Done(ps, Instant::now()));
                     }
                 }
                 WorkerMsg::Result(ids, Err(e)) => {
                     for id in ids {
-                        self.entries.insert(id, Entry::Failed(e.clone()));
+                        self.inflight.remove(&id);
+                        self.entries.insert(id, Entry::Failed(e.clone(), Instant::now()));
                     }
                 }
             }
@@ -681,7 +912,49 @@ impl TrackerApp {
         self.enqueue_missing();
     }
 
-    /// One batched request for every lobby player we have no entry for yet.
+    /// Store the finished game (once) with everyone's ranks as we knew them.
+    fn record_match(&mut self, guid: String, winner: i64) {
+        let guid = if !guid.is_empty() {
+            guid
+        } else if !self.cur_guid.is_empty() {
+            self.cur_guid.clone()
+        } else {
+            format!("t{}", now_ts())
+        };
+        if self.players.len() < 2 || !self.recorded.insert(guid.clone()) {
+            return;
+        }
+        let players = self
+            .players
+            .iter()
+            .map(|p| RecPlayer {
+                name: p.name.clone(),
+                id: p.primary_id.clone(),
+                team: p.team,
+                score: p.score,
+                goals: p.goals,
+                assists: p.assists,
+                saves: p.saves,
+                shots: p.shots,
+                skills: match self.entries.get(&p.primary_id) {
+                    Some(Entry::Done(ps, _)) => ps.skills.clone(),
+                    _ => Vec::new(),
+                },
+            })
+            .collect();
+        let rec = MatchRecord {
+            guid,
+            ts: now_ts(),
+            playlist: playlist_for_size(self.players.len()),
+            my_team: self.my_team(),
+            winner,
+            scores: self.scores.clone(),
+            players,
+        };
+        self.store.push(rec);
+    }
+
+    /// One batched request for every lobby player that is new, stale, or failed a while ago.
     fn enqueue_missing(&mut self) {
         if self.sidecar.state != "ready" {
             return;
@@ -689,7 +962,12 @@ impl TrackerApp {
         let ids: Vec<String> = self
             .players
             .iter()
-            .filter(|p| is_lookupable(&p.primary_id) && !self.entries.contains_key(&p.primary_id))
+            .filter(|p| is_lookupable(&p.primary_id) && !self.inflight.contains(&p.primary_id))
+            .filter(|p| match self.entries.get(&p.primary_id) {
+                None => true,
+                Some(Entry::Done(_, at)) => at.elapsed() > STALE_AFTER,
+                Some(Entry::Failed(_, at)) => at.elapsed() > Duration::from_secs(30),
+            })
             .map(|p| p.primary_id.clone())
             .collect();
         self.send_fetch(ids);
@@ -699,10 +977,156 @@ impl TrackerApp {
         if ids.is_empty() {
             return;
         }
-        for id in &ids {
-            self.entries.insert(id.clone(), Entry::Loading);
-        }
+        self.inflight.extend(ids.iter().cloned());
         let _ = self.req_tx.send(WorkerCmd::Fetch(ids));
+    }
+
+    /// My games per playlist this season, from my own lookup.
+    fn season_games(&self) -> Option<Vec<(u32, u32)>> {
+        let me = self.store.my_id.as_deref()?;
+        match self.entries.get(me) {
+            Some(Entry::Done(ps, _)) => Some(
+                RANKED
+                    .iter()
+                    .map(|pl| (*pl, ps.skills.iter().find(|s| s.playlist == *pl).map_or(0, |s| s.matches)))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn live_page(&mut self, ui: &mut egui::Ui) -> Vec<(String, CardAction)> {
+        let mut actions = Vec::new();
+
+        if self.players.is_empty() {
+            ui.heading("Rocket League Tracker");
+            ui.label("Waiting for a match...");
+            return actions;
+        }
+
+        let my_team = self.my_team();
+        let left_team = my_team.unwrap_or(0);
+        let current_pl = playlist_for_size(self.players.len());
+        let score_of = |t: i64| self.scores.iter().find(|(n, _)| *n == t).map_or(0, |(_, s)| *s);
+        let right_team = self.scores.iter().map(|(n, _)| *n).find(|n| *n != left_team).unwrap_or(1 - left_team);
+        let (left_name, right_name) = if my_team.is_some() {
+            ("Your team", "Opponents")
+        } else if left_team == 0 {
+            ("Blue", "Orange")
+        } else {
+            ("Orange", "Blue")
+        };
+
+        let groups = [
+            (left_name, score_of(left_team), true),
+            (right_name, score_of(right_team), false),
+        ];
+
+        let Self { players, entries, inflight, icons, store, cur_guid, .. } = self;
+        let my_id = store.my_id.clone();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.columns(2, |cols| {
+                for (i, (name, score, is_left)) in groups.iter().enumerate() {
+                    let ui = &mut cols[i];
+                    ui.label(egui::RichText::new(format!("{name}   {score}")).strong().size(18.0));
+                    for p in players.iter().filter(|p| (p.team == left_team) == *is_left) {
+                        let seen = store.encounters(&p.primary_id, cur_guid);
+                        let entry = entries.get(&p.primary_id);
+                        // Censored in-game name -> use the PsyNet profile name if we have it.
+                        let display_name = match entry {
+                            Some(Entry::Done(ps, _)) if is_filtered_name(&p.name) && !ps.name.is_empty() => {
+                                ps.name.clone()
+                            }
+                            _ if is_filtered_name(&p.name) => "(censored name)".to_string(),
+                            _ => p.name.clone(),
+                        };
+                        let ctx = CardCtx {
+                            player: p,
+                            display_name,
+                            entry,
+                            inflight: inflight.contains(&p.primary_id),
+                            is_me: my_id.as_deref() == Some(p.primary_id.as_str()),
+                            current_pl,
+                            seen: &seen,
+                        };
+                        if let Some(a) = draw_card(ui, icons, ctx) {
+                            actions.push((p.primary_id.clone(), a));
+                        }
+                    }
+                }
+            });
+        });
+        actions
+    }
+
+    fn history_page(&mut self, ui: &mut egui::Ui) {
+        if self.store.matches.is_empty() {
+            ui.heading("Game history");
+            ui.label("No games recorded yet. Finished games show up here (last 20).");
+            return;
+        }
+        ui.heading("Last 20 games  (click one for details)");
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for rec in self.store.recent(20) {
+                let resp = egui::Frame::group(ui.style())
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(fmt_ts(rec.ts));
+                            ui.label(egui::RichText::new(playlist_name(rec.playlist)).strong());
+                            ui.label(result_text(rec));
+                            ui.label(score_text(rec));
+                            let others: Vec<&str> = rec
+                                .players
+                                .iter()
+                                .filter(|p| rec.my_team.map_or(true, |t| p.team != t))
+                                .map(|p| p.name.as_str())
+                                .collect();
+                            ui.label(egui::RichText::new(format!("vs {}", others.join(", "))).weak());
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() && !self.open_matches.contains(&rec.guid) {
+                    self.open_matches.push(rec.guid.clone());
+                }
+            }
+        });
+    }
+
+    /// Past games open in their own OS windows.
+    fn show_match_windows(&mut self, ctx: &egui::Context) {
+        let mut keep = Vec::new();
+        for guid in std::mem::take(&mut self.open_matches) {
+            let Some(rec) = self.store.by_guid(&guid).cloned() else {
+                continue;
+            };
+            let mut close = false;
+            let icons = &mut self.icons;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("match", &guid)),
+                egui::ViewportBuilder::default()
+                    .with_title(format!("Game {}", fmt_ts(rec.ts)))
+                    .with_inner_size([820.0, 620.0]),
+                |ctx, class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        close = true;
+                    }
+                    if class == egui::ViewportClass::Embedded {
+                        egui::Window::new("Game").show(ctx, |ui| draw_match_detail(ui, icons, &rec));
+                    } else {
+                        egui::CentralPanel::default().show(ctx, |ui| draw_match_detail(ui, icons, &rec));
+                    }
+                },
+            );
+            if !close {
+                keep.push(guid);
+            }
+        }
+        self.open_matches = keep;
     }
 }
 
@@ -714,10 +1138,8 @@ impl eframe::App for TrackerApp {
         let mut refetch_all = false;
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Playlist:");
-                ui.selectable_value(&mut self.playlist, 10, "1v1");
-                ui.selectable_value(&mut self.playlist, 11, "2v2");
-                ui.selectable_value(&mut self.playlist, 13, "3v3");
+                ui.selectable_value(&mut self.page, Page::Live, "Live");
+                ui.selectable_value(&mut self.page, Page::History, "History");
                 ui.separator();
                 if ui.button("Refetch all").clicked() {
                     refetch_all = true;
@@ -737,17 +1159,51 @@ impl eframe::App for TrackerApp {
             });
         });
 
+        // Session record + season games
+        egui::TopBottomPanel::top("summary").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (w, l) = self.store.record_since(self.session_start);
+                let games = self.store.games_since(self.session_start);
+                ui.label(egui::RichText::new("Session").weak());
+                ui.label(
+                    egui::RichText::new(format!("{w}W - {l}L"))
+                        .strong()
+                        .size(16.0)
+                        .color(if w >= l {
+                            egui::Color32::from_rgb(90, 200, 120)
+                        } else {
+                            egui::Color32::from_rgb(235, 90, 90)
+                        }),
+                );
+                ui.label(egui::RichText::new(format!("({games} games)")).weak());
+                ui.separator();
+                ui.label(egui::RichText::new("Season").weak());
+                match self.season_games() {
+                    Some(g) => {
+                        let txt: Vec<String> =
+                            g.iter().map(|(pl, n)| format!("{} {n}", playlist_name(*pl))).collect();
+                        ui.label(txt.join("   "));
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("(click \"That's me\" on your card)").weak(),
+                        );
+                    }
+                }
+            });
+        });
+
         if refetch_all {
             let ids = self
                 .players
                 .iter()
-                .filter(|p| is_lookupable(&p.primary_id))
+                .filter(|p| is_lookupable(&p.primary_id) && !self.inflight.contains(&p.primary_id))
                 .map(|p| p.primary_id.clone())
                 .collect();
             self.send_fetch(ids);
         }
 
-        let mut refetch_one: Option<String> = None;
+        let mut actions: Vec<(String, CardAction)> = Vec::new();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.sidecar.state.as_str() {
@@ -780,64 +1236,20 @@ impl eframe::App for TrackerApp {
                 _ => {}
             }
 
-            if self.players.is_empty() {
-                ui.heading("Rocket League Tracker");
-                ui.label("Waiting for a match...");
-                return;
-            }
-
-            // 1v1: 2 side by side. 2v2: 2x2. 3v3: 3x2.
-            let cols: usize = if self.playlist == 13 { 3 } else { 2 };
-            let shown = self.players.len().min(8);
-            let rows = shown.div_ceil(cols).max(1);
-
-            let gap = ui.spacing().item_spacing.y;
-            let row_h =
-                ((ui.available_height() - gap * (rows as f32 - 1.0)) / rows as f32).max(120.0);
-
-            let playlist = self.playlist;
-            let players = &self.players;
-            let entries = &self.entries;
-            let icons = &mut self.icons;
-
-            for r in 0..rows {
-                ui.columns(cols, |uis| {
-                    for c in 0..cols {
-                        let idx = r * cols + c;
-                        if idx >= shown {
-                            continue;
-                        }
-                        let p = &players[idx];
-                        let entry = entries.get(&p.primary_id);
-                        // Censored in-game name -> use the PsyNet profile name if we have it.
-                        let name = match entry {
-                            Some(Entry::Done(ps))
-                                if is_filtered_name(&p.name) && !ps.name.is_empty() =>
-                            {
-                                ps.name.clone()
-                            }
-                            _ if is_filtered_name(&p.name) => "(censored name)".to_string(),
-                            _ => p.name.clone(),
-                        };
-                        if draw_card(
-                            &mut uis[c],
-                            entry,
-                            row_h,
-                            icons,
-                            &name,
-                            playlist,
-                            is_lookupable(&p.primary_id),
-                        ) {
-                            refetch_one = Some(p.primary_id.clone());
-                        }
-                    }
-                });
+            match self.page {
+                Page::Live => actions = self.live_page(ui),
+                Page::History => self.history_page(ui),
             }
         });
 
-        if let Some(id) = refetch_one {
-            self.send_fetch(vec![id]);
+        for (id, a) in actions {
+            match a {
+                CardAction::Refetch => self.send_fetch(vec![id]),
+                CardAction::ThatsMe => self.store.set_me(&id),
+            }
         }
+
+        self.show_match_windows(ctx);
     }
 }
 
@@ -855,7 +1267,7 @@ fn main() -> eframe::Result<()> {
     }
 
     // Rocket League stats stream -> UI
-    let (tx, rx) = std_mpsc::channel::<Vec<PlayerInfo>>();
+    let (tx, rx) = std_mpsc::channel::<StatsMsg>();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         rt.block_on(run_stats_client(tx));
@@ -883,7 +1295,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 760.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1250.0, 800.0]),
         ..Default::default()
     };
     let result = eframe::run_native(
